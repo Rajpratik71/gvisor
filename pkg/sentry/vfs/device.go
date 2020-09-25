@@ -22,6 +22,8 @@ import (
 )
 
 // DeviceKind indicates whether a device is a block or character device.
+//
+// +stateify savable
 type DeviceKind uint32
 
 const (
@@ -44,6 +46,7 @@ func (kind DeviceKind) String() string {
 	}
 }
 
+// +stateify savable
 type devTuple struct {
 	kind  DeviceKind
 	major uint32
@@ -103,7 +106,7 @@ func (vfs *VirtualFilesystem) OpenDeviceSpecialFile(ctx context.Context, mnt *Mo
 }
 
 // GetAnonBlockDevMinor allocates and returns an unused minor device number for
-// an "anonymous" block device with major number 0.
+// an "anonymous" block device with major number UNNAMED_MAJOR.
 func (vfs *VirtualFilesystem) GetAnonBlockDevMinor() (uint32, error) {
 	vfs.anonBlockDevMinorMu.Lock()
 	defer vfs.anonBlockDevMinorMu.Unlock()

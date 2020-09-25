@@ -27,21 +27,24 @@ import (
 var epollCycleMu sync.Mutex
 
 // EpollInstance represents an epoll instance, as described by epoll(7).
+//
+// +stateify savable
 type EpollInstance struct {
 	vfsfd FileDescription
 	FileDescriptionDefaultImpl
 	DentryMetadataFileDescriptionImpl
+	NoLockFD
 
 	// q holds waiters on this EpollInstance.
 	q waiter.Queue
 
 	// interest is the set of file descriptors that are registered with the
 	// EpollInstance for monitoring. interest is protected by interestMu.
-	interestMu sync.Mutex
+	interestMu sync.Mutex `state:"nosave"`
 	interest   map[epollInterestKey]*epollInterest
 
 	// mu protects fields in registered epollInterests.
-	mu sync.Mutex
+	mu sync.Mutex `state:"nosave"`
 
 	// ready is the set of file descriptors that may be "ready" for I/O. Note
 	// that this must be an ordered list, not a map: "If more than maxevents
@@ -54,6 +57,7 @@ type EpollInstance struct {
 	ready epollInterestList
 }
 
+// +stateify savable
 type epollInterestKey struct {
 	// file is the registered FileDescription. No reference is held on file;
 	// instead, when the last reference is dropped, FileDescription.DecRef()
@@ -66,6 +70,8 @@ type epollInterestKey struct {
 }
 
 // epollInterest represents an EpollInstance's interest in a file descriptor.
+//
+// +stateify savable
 type epollInterest struct {
 	// epoll is the owning EpollInstance. epoll is immutable.
 	epoll *EpollInstance
@@ -92,13 +98,15 @@ type epollInterest struct {
 
 // NewEpollInstanceFD returns a FileDescription representing a new epoll
 // instance. A reference is taken on the returned FileDescription.
-func (vfs *VirtualFilesystem) NewEpollInstanceFD() (*FileDescription, error) {
+func (vfs *VirtualFilesystem) NewEpollInstanceFD(ctx context.Context) (*FileDescription, error) {
 	vd := vfs.NewAnonVirtualDentry("[eventpoll]")
-	defer vd.DecRef()
+	defer vd.DecRef(ctx)
 	ep := &EpollInstance{
 		interest: make(map[epollInterestKey]*epollInterest),
 	}
 	if err := ep.vfsfd.Init(ep, linux.O_RDWR, vd.Mount(), vd.Dentry(), &FileDescriptionOptions{
+		DenyPRead:         true,
+		DenyPWrite:        true,
 		UseDentryMetadata: true,
 	}); err != nil {
 		return nil, err
@@ -107,7 +115,7 @@ func (vfs *VirtualFilesystem) NewEpollInstanceFD() (*FileDescription, error) {
 }
 
 // Release implements FileDescriptionImpl.Release.
-func (ep *EpollInstance) Release() {
+func (ep *EpollInstance) Release(ctx context.Context) {
 	// Unregister all polled fds.
 	ep.interestMu.Lock()
 	defer ep.interestMu.Unlock()
@@ -183,13 +191,14 @@ func (ep *EpollInstance) AddInterest(file *FileDescription, num int32, event lin
 	}
 
 	// Register interest in file.
-	mask := event.Events | linux.EPOLLERR | linux.EPOLLRDHUP
+	mask := event.Events | linux.EPOLLERR | linux.EPOLLHUP
 	epi := &epollInterest{
 		epoll:    ep,
 		key:      key,
 		mask:     mask,
 		userData: event.Data,
 	}
+	epi.waiter.Callback = epi
 	ep.interest[key] = epi
 	wmask := waiter.EventMaskFromLinux(mask)
 	file.EventRegister(&epi.waiter, wmask)
@@ -253,7 +262,7 @@ func (ep *EpollInstance) ModifyInterest(file *FileDescription, num int32, event 
 	}
 
 	// Update epi for the next call to ep.ReadEvents().
-	mask := event.Events | linux.EPOLLERR | linux.EPOLLRDHUP
+	mask := event.Events | linux.EPOLLERR | linux.EPOLLHUP
 	ep.mu.Lock()
 	epi.mask = mask
 	epi.userData = event.Data
@@ -327,11 +336,9 @@ func (ep *EpollInstance) removeLocked(epi *epollInterest) {
 	ep.mu.Unlock()
 }
 
-// ReadEvents reads up to len(events) ready events into events and returns the
-// number of events read.
-//
-// Preconditions: len(events) != 0.
-func (ep *EpollInstance) ReadEvents(events []linux.EpollEvent) int {
+// ReadEvents appends up to maxReady events to events and returns the updated
+// slice of events.
+func (ep *EpollInstance) ReadEvents(events []linux.EpollEvent, maxEvents int) []linux.EpollEvent {
 	i := 0
 	// Hot path: avoid defer.
 	ep.mu.Lock()
@@ -364,16 +371,16 @@ func (ep *EpollInstance) ReadEvents(events []linux.EpollEvent) int {
 			requeue.PushBack(epi)
 		}
 		// Report ievents.
-		events[i] = linux.EpollEvent{
+		events = append(events, linux.EpollEvent{
 			Events: ievents.ToLinux(),
 			Data:   epi.userData,
-		}
+		})
 		i++
-		if i == len(events) {
+		if i == maxEvents {
 			break
 		}
 	}
 	ep.ready.PushBackList(&requeue)
 	ep.mu.Unlock()
-	return i
+	return events
 }

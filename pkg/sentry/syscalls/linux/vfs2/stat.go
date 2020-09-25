@@ -16,6 +16,7 @@ package vfs2
 
 import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/bits"
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/gohacks"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
@@ -64,7 +65,7 @@ func fstatat(t *kernel.Task, dirfd int32, pathAddr, statAddr usermem.Addr, flags
 	}
 
 	root := t.FSContext().RootDirectoryVFS2()
-	defer root.DecRef()
+	defer root.DecRef(t)
 	start := root
 	if !path.Absolute {
 		if !path.HasComponents() && flags&linux.AT_EMPTY_PATH == 0 {
@@ -72,7 +73,7 @@ func fstatat(t *kernel.Task, dirfd int32, pathAddr, statAddr usermem.Addr, flags
 		}
 		if dirfd == linux.AT_FDCWD {
 			start = t.FSContext().WorkingDirectoryVFS2()
-			defer start.DecRef()
+			defer start.DecRef(t)
 		} else {
 			dirfile := t.GetFileVFS2(dirfd)
 			if dirfile == nil {
@@ -84,18 +85,19 @@ func fstatat(t *kernel.Task, dirfd int32, pathAddr, statAddr usermem.Addr, flags
 				// former may be able to use opened file state to expedite the
 				// Stat.
 				statx, err := dirfile.Stat(t, opts)
-				dirfile.DecRef()
+				dirfile.DecRef(t)
 				if err != nil {
 					return err
 				}
 				var stat linux.Stat
 				convertStatxToUserStat(t, &statx, &stat)
-				return stat.CopyOut(t, statAddr)
+				_, err = stat.CopyOut(t, statAddr)
+				return err
 			}
 			start = dirfile.VirtualDentry()
 			start.IncRef()
-			defer start.DecRef()
-			dirfile.DecRef()
+			defer start.DecRef(t)
+			dirfile.DecRef(t)
 		}
 	}
 
@@ -110,7 +112,8 @@ func fstatat(t *kernel.Task, dirfd int32, pathAddr, statAddr usermem.Addr, flags
 	}
 	var stat linux.Stat
 	convertStatxToUserStat(t, &statx, &stat)
-	return stat.CopyOut(t, statAddr)
+	_, err = stat.CopyOut(t, statAddr)
+	return err
 }
 
 func timespecFromStatxTimestamp(sxts linux.StatxTimestamp) linux.Timespec {
@@ -129,7 +132,7 @@ func Fstat(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 	if file == nil {
 		return 0, nil, syserror.EBADF
 	}
-	defer file.DecRef()
+	defer file.DecRef(t)
 
 	statx, err := file.Stat(t, vfs.StatOptions{
 		Mask: linux.STATX_BASIC_STATS,
@@ -139,7 +142,8 @@ func Fstat(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 	}
 	var stat linux.Stat
 	convertStatxToUserStat(t, &statx, &stat)
-	return 0, nil, stat.CopyOut(t, statAddr)
+	_, err = stat.CopyOut(t, statAddr)
+	return 0, nil, err
 }
 
 // Statx implements Linux syscall statx(2).
@@ -150,7 +154,15 @@ func Statx(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 	mask := args[3].Uint()
 	statxAddr := args[4].Pointer()
 
-	if flags&^(linux.AT_EMPTY_PATH|linux.AT_SYMLINK_NOFOLLOW) != 0 {
+	if flags&^(linux.AT_EMPTY_PATH|linux.AT_SYMLINK_NOFOLLOW|linux.AT_STATX_SYNC_TYPE) != 0 {
+		return 0, nil, syserror.EINVAL
+	}
+	// Make sure that only one sync type option is set.
+	syncType := uint32(flags & linux.AT_STATX_SYNC_TYPE)
+	if syncType != 0 && !bits.IsPowerOfTwo32(syncType) {
+		return 0, nil, syserror.EINVAL
+	}
+	if mask&linux.STATX__RESERVED != 0 {
 		return 0, nil, syserror.EINVAL
 	}
 
@@ -165,7 +177,7 @@ func Statx(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 	}
 
 	root := t.FSContext().RootDirectoryVFS2()
-	defer root.DecRef()
+	defer root.DecRef(t)
 	start := root
 	if !path.Absolute {
 		if !path.HasComponents() && flags&linux.AT_EMPTY_PATH == 0 {
@@ -173,7 +185,7 @@ func Statx(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 		}
 		if dirfd == linux.AT_FDCWD {
 			start = t.FSContext().WorkingDirectoryVFS2()
-			defer start.DecRef()
+			defer start.DecRef(t)
 		} else {
 			dirfile := t.GetFileVFS2(dirfd)
 			if dirfile == nil {
@@ -185,17 +197,18 @@ func Statx(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 				// former may be able to use opened file state to expedite the
 				// Stat.
 				statx, err := dirfile.Stat(t, opts)
-				dirfile.DecRef()
+				dirfile.DecRef(t)
 				if err != nil {
 					return 0, nil, err
 				}
 				userifyStatx(t, &statx)
-				return 0, nil, statx.CopyOut(t, statxAddr)
+				_, err = statx.CopyOut(t, statxAddr)
+				return 0, nil, err
 			}
 			start = dirfile.VirtualDentry()
 			start.IncRef()
-			defer start.DecRef()
-			dirfile.DecRef()
+			defer start.DecRef(t)
+			dirfile.DecRef(t)
 		}
 	}
 
@@ -209,7 +222,8 @@ func Statx(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 		return 0, nil, err
 	}
 	userifyStatx(t, &statx)
-	return 0, nil, statx.CopyOut(t, statxAddr)
+	_, err = statx.CopyOut(t, statxAddr)
+	return 0, nil, err
 }
 
 func userifyStatx(t *kernel.Task, statx *linux.Statx) {
@@ -228,14 +242,65 @@ func Readlink(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Sysc
 
 // Access implements Linux syscall access(2).
 func Access(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
-	// FIXME(jamieliu): actually implement
-	return 0, nil, nil
+	addr := args[0].Pointer()
+	mode := args[1].ModeT()
+
+	return 0, nil, accessAt(t, linux.AT_FDCWD, addr, mode)
 }
 
-// Faccessat implements Linux syscall access(2).
+// Faccessat implements Linux syscall faccessat(2).
+//
+// Note that the faccessat() system call does not take a flags argument:
+// "The raw faccessat() system call takes only the first three arguments. The
+// AT_EACCESS and AT_SYMLINK_NOFOLLOW flags are actually implemented within
+// the glibc wrapper function for faccessat().  If either of these flags is
+// specified, then the wrapper function employs fstatat(2) to determine access
+// permissions." - faccessat(2)
 func Faccessat(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
-	// FIXME(jamieliu): actually implement
-	return 0, nil, nil
+	dirfd := args[0].Int()
+	addr := args[1].Pointer()
+	mode := args[2].ModeT()
+
+	return 0, nil, accessAt(t, dirfd, addr, mode)
+}
+
+func accessAt(t *kernel.Task, dirfd int32, pathAddr usermem.Addr, mode uint) error {
+	const rOK = 4
+	const wOK = 2
+	const xOK = 1
+
+	// Sanity check the mode.
+	if mode&^(rOK|wOK|xOK) != 0 {
+		return syserror.EINVAL
+	}
+
+	path, err := copyInPath(t, pathAddr)
+	if err != nil {
+		return err
+	}
+	tpop, err := getTaskPathOperation(t, dirfd, path, disallowEmptyPath, followFinalSymlink)
+	if err != nil {
+		return err
+	}
+	defer tpop.Release(t)
+
+	// access(2) and faccessat(2) check permissions using real
+	// UID/GID, not effective UID/GID.
+	//
+	// "access() needs to use the real uid/gid, not the effective
+	// uid/gid. We do this by temporarily clearing all FS-related
+	// capabilities and switching the fsuid/fsgid around to the
+	// real ones." -fs/open.c:faccessat
+	creds := t.Credentials().Fork()
+	creds.EffectiveKUID = creds.RealKUID
+	creds.EffectiveKGID = creds.RealKGID
+	if creds.EffectiveKUID.In(creds.UserNamespace) == auth.RootUID {
+		creds.EffectiveCaps = creds.PermittedCaps
+	} else {
+		creds.EffectiveCaps = 0
+	}
+
+	return t.Kernel().VFS().AccessAt(t, creds, vfs.AccessTypes(mode), &tpop.pop)
 }
 
 // Readlinkat implements Linux syscall mknodat(2).
@@ -263,7 +328,7 @@ func readlinkat(t *kernel.Task, dirfd int32, pathAddr, bufAddr usermem.Addr, siz
 	if err != nil {
 		return 0, nil, err
 	}
-	defer tpop.Release()
+	defer tpop.Release(t)
 
 	target, err := t.Kernel().VFS().ReadlinkAt(t, t.Credentials(), &tpop.pop)
 	if err != nil {
@@ -293,14 +358,14 @@ func Statfs(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscal
 	if err != nil {
 		return 0, nil, err
 	}
-	defer tpop.Release()
+	defer tpop.Release(t)
 
 	statfs, err := t.Kernel().VFS().StatFSAt(t, t.Credentials(), &tpop.pop)
 	if err != nil {
 		return 0, nil, err
 	}
-
-	return 0, nil, statfs.CopyOut(t, bufAddr)
+	_, err = statfs.CopyOut(t, bufAddr)
+	return 0, nil, err
 }
 
 // Fstatfs implements Linux syscall fstatfs(2).
@@ -312,12 +377,12 @@ func Fstatfs(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Sysca
 	if err != nil {
 		return 0, nil, err
 	}
-	defer tpop.Release()
+	defer tpop.Release(t)
 
 	statfs, err := t.Kernel().VFS().StatFSAt(t, t.Credentials(), &tpop.pop)
 	if err != nil {
 		return 0, nil, err
 	}
-
-	return 0, nil, statfs.CopyOut(t, bufAddr)
+	_, err = statfs.CopyOut(t, bufAddr)
+	return 0, nil, err
 }

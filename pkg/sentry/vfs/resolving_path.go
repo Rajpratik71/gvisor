@@ -18,6 +18,7 @@ import (
 	"fmt"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sync"
@@ -29,9 +30,13 @@ import (
 //
 // From the perspective of FilesystemImpl methods, a ResolvingPath represents a
 // starting Dentry on the associated Filesystem (on which a reference is
-// already held) and a stream of path components relative to that Dentry.
+// already held), a stream of path components relative to that Dentry, and
+// elements of the invoking Context that are commonly required by
+// FilesystemImpl methods.
 //
 // ResolvingPath is loosely analogous to Linux's struct nameidata.
+//
+// +stateify savable
 type ResolvingPath struct {
 	vfs   *VirtualFilesystem
 	root  VirtualDentry // refs borrowed from PathOperation
@@ -85,6 +90,7 @@ func init() {
 // so error "constants" are really mutable vars, necessitating somewhat
 // expensive interface object comparisons.
 
+// +stateify savable
 type resolveMountRootOrJumpError struct{}
 
 // Error implements error.Error.
@@ -92,6 +98,7 @@ func (resolveMountRootOrJumpError) Error() string {
 	return "resolving mount root or jump"
 }
 
+// +stateify savable
 type resolveMountPointError struct{}
 
 // Error implements error.Error.
@@ -99,6 +106,7 @@ func (resolveMountPointError) Error() string {
 	return "resolving mount point"
 }
 
+// +stateify savable
 type resolveAbsSymlinkError struct{}
 
 // Error implements error.Error.
@@ -134,31 +142,31 @@ func (vfs *VirtualFilesystem) getResolvingPath(creds *auth.Credentials, pop *Pat
 	return rp
 }
 
-func (vfs *VirtualFilesystem) putResolvingPath(rp *ResolvingPath) {
+func (vfs *VirtualFilesystem) putResolvingPath(ctx context.Context, rp *ResolvingPath) {
 	rp.root = VirtualDentry{}
-	rp.decRefStartAndMount()
+	rp.decRefStartAndMount(ctx)
 	rp.mount = nil
 	rp.start = nil
-	rp.releaseErrorState()
+	rp.releaseErrorState(ctx)
 	resolvingPathPool.Put(rp)
 }
 
-func (rp *ResolvingPath) decRefStartAndMount() {
+func (rp *ResolvingPath) decRefStartAndMount(ctx context.Context) {
 	if rp.flags&rpflagsHaveStartRef != 0 {
-		rp.start.DecRef()
+		rp.start.DecRef(ctx)
 	}
 	if rp.flags&rpflagsHaveMountRef != 0 {
-		rp.mount.DecRef()
+		rp.mount.DecRef(ctx)
 	}
 }
 
-func (rp *ResolvingPath) releaseErrorState() {
+func (rp *ResolvingPath) releaseErrorState(ctx context.Context) {
 	if rp.nextStart != nil {
-		rp.nextStart.DecRef()
+		rp.nextStart.DecRef(ctx)
 		rp.nextStart = nil
 	}
 	if rp.nextMount != nil {
-		rp.nextMount.DecRef()
+		rp.nextMount.DecRef(ctx)
 		rp.nextMount = nil
 	}
 }
@@ -234,13 +242,13 @@ func (rp *ResolvingPath) Advance() {
 
 // Restart resets the stream of path components represented by rp to its state
 // on entry to the current FilesystemImpl method.
-func (rp *ResolvingPath) Restart() {
+func (rp *ResolvingPath) Restart(ctx context.Context) {
 	rp.pit = rp.origParts[rp.numOrigParts-1]
 	rp.mustBeDir = rp.mustBeDirOrig
 	rp.symlinks = rp.symlinksOrig
 	rp.curPart = rp.numOrigParts - 1
 	copy(rp.parts[:], rp.origParts[:rp.numOrigParts])
-	rp.releaseErrorState()
+	rp.releaseErrorState(ctx)
 }
 
 func (rp *ResolvingPath) relpathCommit() {
@@ -251,88 +259,67 @@ func (rp *ResolvingPath) relpathCommit() {
 	rp.origParts[rp.curPart] = rp.pit
 }
 
-// ResolveParent returns the VFS parent of d. It does not take a reference on
-// the returned Dentry.
-//
-// Preconditions: There are no concurrent mutators of d.
-//
-// Postconditions: If the returned error is nil, then the returned Dentry is
-// not nil.
-func (rp *ResolvingPath) ResolveParent(d *Dentry) (*Dentry, error) {
-	var parent *Dentry
+// CheckRoot is called before resolving the parent of the Dentry d. If the
+// Dentry is contextually a VFS root, such that path resolution should treat
+// d's parent as itself, CheckRoot returns (true, nil). If the Dentry is the
+// root of a non-root mount, such that path resolution should switch to another
+// Mount, CheckRoot returns (unspecified, non-nil error). Otherwise, path
+// resolution should resolve d's parent normally, and CheckRoot returns (false,
+// nil).
+func (rp *ResolvingPath) CheckRoot(ctx context.Context, d *Dentry) (bool, error) {
 	if d == rp.root.dentry && rp.mount == rp.root.mount {
-		// At contextual VFS root.
-		parent = d
+		// At contextual VFS root (due to e.g. chroot(2)).
+		return true, nil
 	} else if d == rp.mount.root {
 		// At mount root ...
-		vd := rp.vfs.getMountpointAt(rp.mount, rp.root)
+		vd := rp.vfs.getMountpointAt(ctx, rp.mount, rp.root)
 		if vd.Ok() {
 			// ... of non-root mount.
 			rp.nextMount = vd.mount
 			rp.nextStart = vd.dentry
-			return nil, resolveMountRootOrJumpError{}
+			return false, resolveMountRootOrJumpError{}
 		}
 		// ... of root mount.
-		parent = d
-	} else if d.parent == nil {
-		// At filesystem root.
-		parent = d
-	} else {
-		parent = d.parent
+		return true, nil
 	}
-	if parent.isMounted() {
-		if mnt := rp.vfs.getMountAt(rp.mount, parent); mnt != nil {
-			rp.nextMount = mnt
-			return nil, resolveMountPointError{}
-		}
-	}
-	return parent, nil
+	return false, nil
 }
 
-// ResolveChild returns the VFS child of d with the given name. It does not
-// take a reference on the returned Dentry. If no such child exists,
-// ResolveChild returns (nil, nil).
-//
-// Preconditions: There are no concurrent mutators of d.
-func (rp *ResolvingPath) ResolveChild(d *Dentry, name string) (*Dentry, error) {
-	child := d.children[name]
-	if child == nil {
-		return nil, nil
+// CheckMount is called after resolving the parent or child of another Dentry
+// to d. If d is a mount point, such that path resolution should switch to
+// another Mount, CheckMount returns a non-nil error. Otherwise, CheckMount
+// returns nil.
+func (rp *ResolvingPath) CheckMount(ctx context.Context, d *Dentry) error {
+	if !d.isMounted() {
+		return nil
 	}
-	if child.isMounted() {
-		if mnt := rp.vfs.getMountAt(rp.mount, child); mnt != nil {
-			rp.nextMount = mnt
-			return nil, resolveMountPointError{}
-		}
+	if mnt := rp.vfs.getMountAt(ctx, rp.mount, d); mnt != nil {
+		rp.nextMount = mnt
+		return resolveMountPointError{}
 	}
-	return child, nil
-}
-
-// ResolveComponent returns the Dentry reached by starting at d and resolving
-// the current path component in the stream represented by rp. It does not
-// advance the stream. It does not take a reference on the returned Dentry. If
-// no such Dentry exists, ResolveComponent returns (nil, nil).
-//
-// Preconditions: !rp.Done(). There are no concurrent mutators of d.
-func (rp *ResolvingPath) ResolveComponent(d *Dentry) (*Dentry, error) {
-	switch pc := rp.Component(); pc {
-	case ".":
-		return d, nil
-	case "..":
-		return rp.ResolveParent(d)
-	default:
-		return rp.ResolveChild(d, pc)
-	}
+	return nil
 }
 
 // ShouldFollowSymlink returns true if, supposing that the current path
 // component in pcs represents a symbolic link, the symbolic link should be
 // followed.
 //
+// If path is terminated with '/', the '/' is considered the last element and
+// any symlink before that is followed:
+//   - For most non-creating walks, the last path component is handled by
+//     fs/namei.c:lookup_last(), which sets LOOKUP_FOLLOW if the first byte
+//     after the path component is non-NULL (which is only possible if it's '/')
+//     and the path component is of type LAST_NORM.
+//
+//   - For open/openat/openat2 without O_CREAT, the last path component is
+//     handled by fs/namei.c:do_last(), which does the same, though without the
+//     LAST_NORM check.
+//
 // Preconditions: !rp.Done().
 func (rp *ResolvingPath) ShouldFollowSymlink() bool {
-	// Non-final symlinks are always followed.
-	return rp.flags&rpflagsFollowFinalSymlink != 0 || !rp.Final()
+	// Non-final symlinks are always followed. Paths terminated with '/' are also
+	// always followed.
+	return rp.flags&rpflagsFollowFinalSymlink != 0 || !rp.Final() || rp.MustBeDir()
 }
 
 // HandleSymlink is called when the current path component is a symbolic link
@@ -408,11 +395,11 @@ func (rp *ResolvingPath) HandleJump(target VirtualDentry) error {
 	return resolveMountRootOrJumpError{}
 }
 
-func (rp *ResolvingPath) handleError(err error) bool {
+func (rp *ResolvingPath) handleError(ctx context.Context, err error) bool {
 	switch err.(type) {
 	case resolveMountRootOrJumpError:
 		// Switch to the new Mount. We hold references on the Mount and Dentry.
-		rp.decRefStartAndMount()
+		rp.decRefStartAndMount(ctx)
 		rp.mount = rp.nextMount
 		rp.start = rp.nextStart
 		rp.flags |= rpflagsHaveMountRef | rpflagsHaveStartRef
@@ -431,7 +418,7 @@ func (rp *ResolvingPath) handleError(err error) bool {
 	case resolveMountPointError:
 		// Switch to the new Mount. We hold a reference on the Mount, but
 		// borrow the reference on the mount root from the Mount.
-		rp.decRefStartAndMount()
+		rp.decRefStartAndMount(ctx)
 		rp.mount = rp.nextMount
 		rp.start = rp.nextMount.root
 		rp.flags = rp.flags&^rpflagsHaveStartRef | rpflagsHaveMountRef
@@ -442,12 +429,12 @@ func (rp *ResolvingPath) handleError(err error) bool {
 		// path.
 		rp.relpathCommit()
 		// Restart path resolution on the new Mount.
-		rp.releaseErrorState()
+		rp.releaseErrorState(ctx)
 		return true
 
 	case resolveAbsSymlinkError:
 		// Switch to the new Mount. References are borrowed from rp.root.
-		rp.decRefStartAndMount()
+		rp.decRefStartAndMount(ctx)
 		rp.mount = rp.root.mount
 		rp.start = rp.root.dentry
 		rp.flags &^= rpflagsHaveMountRef | rpflagsHaveStartRef
@@ -459,7 +446,7 @@ func (rp *ResolvingPath) handleError(err error) bool {
 		// path, including the symlink target we just prepended.
 		rp.relpathCommit()
 		// Restart path resolution on the new Mount.
-		rp.releaseErrorState()
+		rp.releaseErrorState(ctx)
 		return true
 
 	default:

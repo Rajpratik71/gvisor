@@ -21,6 +21,7 @@ import (
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
+	"gvisor.dev/gvisor/pkg/sentry/socket/unix/transport"
 	"gvisor.dev/gvisor/pkg/syserror"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
@@ -41,19 +42,44 @@ func (vfs *VirtualFilesystem) NewAnonVirtualDentry(name string) VirtualDentry {
 	}
 }
 
-const anonfsBlockSize = usermem.PageSize // via fs/libfs.c:pseudo_fs_fill_super()
+const (
+	anonfsBlockSize = usermem.PageSize // via fs/libfs.c:pseudo_fs_fill_super()
+
+	// Mode, UID, and GID for a generic anonfs file.
+	anonFileMode = 0600 // no type is correct
+	anonFileUID  = auth.RootKUID
+	anonFileGID  = auth.RootKGID
+)
+
+// anonFilesystemType implements FilesystemType.
+//
+// +stateify savable
+type anonFilesystemType struct{}
+
+// GetFilesystem implements FilesystemType.GetFilesystem.
+func (anonFilesystemType) GetFilesystem(context.Context, *VirtualFilesystem, *auth.Credentials, string, GetFilesystemOptions) (*Filesystem, *Dentry, error) {
+	panic("cannot instaniate an anon filesystem")
+}
+
+// Name implemenents FilesystemType.Name.
+func (anonFilesystemType) Name() string {
+	return "none"
+}
 
 // anonFilesystem is the implementation of FilesystemImpl that backs
 // VirtualDentries returned by VirtualFilesystem.NewAnonVirtualDentry().
 //
 // Since all Dentries in anonFilesystem are non-directories, all FilesystemImpl
 // methods that would require an anonDentry to be a directory return ENOTDIR.
+//
+// +stateify savable
 type anonFilesystem struct {
 	vfsfs Filesystem
 
 	devMinor uint32
 }
 
+// +stateify savable
 type anonDentry struct {
 	vfsd Dentry
 
@@ -61,12 +87,20 @@ type anonDentry struct {
 }
 
 // Release implements FilesystemImpl.Release.
-func (fs *anonFilesystem) Release() {
+func (fs *anonFilesystem) Release(ctx context.Context) {
 }
 
 // Sync implements FilesystemImpl.Sync.
 func (fs *anonFilesystem) Sync(ctx context.Context) error {
 	return nil
+}
+
+// AccessAt implements vfs.Filesystem.Impl.AccessAt.
+func (fs *anonFilesystem) AccessAt(ctx context.Context, rp *ResolvingPath, creds *auth.Credentials, ats AccessTypes) error {
+	if !rp.Done() {
+		return syserror.ENOTDIR
+	}
+	return GenericCheckPermissions(creds, ats, anonFileMode, anonFileUID, anonFileGID)
 }
 
 // GetDentryAt implements FilesystemImpl.GetDentryAt.
@@ -167,13 +201,13 @@ func (fs *anonFilesystem) StatAt(ctx context.Context, rp *ResolvingPath, opts St
 		Mask:     linux.STATX_TYPE | linux.STATX_MODE | linux.STATX_NLINK | linux.STATX_UID | linux.STATX_GID | linux.STATX_INO | linux.STATX_SIZE | linux.STATX_BLOCKS,
 		Blksize:  anonfsBlockSize,
 		Nlink:    1,
-		UID:      uint32(auth.RootKUID),
-		GID:      uint32(auth.RootKGID),
-		Mode:     0600, // no type is correct
+		UID:      uint32(anonFileUID),
+		GID:      uint32(anonFileGID),
+		Mode:     anonFileMode,
 		Ino:      1,
 		Size:     0,
 		Blocks:   0,
-		DevMajor: 0,
+		DevMajor: linux.UNNAMED_MAJOR,
 		DevMinor: fs.devMinor,
 	}, nil
 }
@@ -205,32 +239,43 @@ func (fs *anonFilesystem) UnlinkAt(ctx context.Context, rp *ResolvingPath) error
 	return syserror.EPERM
 }
 
-// ListxattrAt implements FilesystemImpl.ListxattrAt.
-func (fs *anonFilesystem) ListxattrAt(ctx context.Context, rp *ResolvingPath) ([]string, error) {
+// BoundEndpointAt implements FilesystemImpl.BoundEndpointAt.
+func (fs *anonFilesystem) BoundEndpointAt(ctx context.Context, rp *ResolvingPath, opts BoundEndpointOptions) (transport.BoundEndpoint, error) {
+	if !rp.Final() {
+		return nil, syserror.ENOTDIR
+	}
+	if err := GenericCheckPermissions(rp.Credentials(), MayWrite, anonFileMode, anonFileUID, anonFileGID); err != nil {
+		return nil, err
+	}
+	return nil, syserror.ECONNREFUSED
+}
+
+// ListXattrAt implements FilesystemImpl.ListXattrAt.
+func (fs *anonFilesystem) ListXattrAt(ctx context.Context, rp *ResolvingPath, size uint64) ([]string, error) {
 	if !rp.Done() {
 		return nil, syserror.ENOTDIR
 	}
 	return nil, nil
 }
 
-// GetxattrAt implements FilesystemImpl.GetxattrAt.
-func (fs *anonFilesystem) GetxattrAt(ctx context.Context, rp *ResolvingPath, name string) (string, error) {
+// GetXattrAt implements FilesystemImpl.GetXattrAt.
+func (fs *anonFilesystem) GetXattrAt(ctx context.Context, rp *ResolvingPath, opts GetXattrOptions) (string, error) {
 	if !rp.Done() {
 		return "", syserror.ENOTDIR
 	}
 	return "", syserror.ENOTSUP
 }
 
-// SetxattrAt implements FilesystemImpl.SetxattrAt.
-func (fs *anonFilesystem) SetxattrAt(ctx context.Context, rp *ResolvingPath, opts SetxattrOptions) error {
+// SetXattrAt implements FilesystemImpl.SetXattrAt.
+func (fs *anonFilesystem) SetXattrAt(ctx context.Context, rp *ResolvingPath, opts SetXattrOptions) error {
 	if !rp.Done() {
 		return syserror.ENOTDIR
 	}
 	return syserror.EPERM
 }
 
-// RemovexattrAt implements FilesystemImpl.RemovexattrAt.
-func (fs *anonFilesystem) RemovexattrAt(ctx context.Context, rp *ResolvingPath, name string) error {
+// RemoveXattrAt implements FilesystemImpl.RemoveXattrAt.
+func (fs *anonFilesystem) RemoveXattrAt(ctx context.Context, rp *ResolvingPath, name string) error {
 	if !rp.Done() {
 		return syserror.ENOTDIR
 	}
@@ -254,6 +299,21 @@ func (d *anonDentry) TryIncRef() bool {
 }
 
 // DecRef implements DentryImpl.DecRef.
-func (d *anonDentry) DecRef() {
+func (d *anonDentry) DecRef(ctx context.Context) {
 	// no-op
 }
+
+// InotifyWithParent implements DentryImpl.InotifyWithParent.
+//
+// Although Linux technically supports inotify on pseudo filesystems (inotify
+// is implemented at the vfs layer), it is not particularly useful. It is left
+// unimplemented until someone actually needs it.
+func (d *anonDentry) InotifyWithParent(ctx context.Context, events, cookie uint32, et EventType) {}
+
+// Watches implements DentryImpl.Watches.
+func (d *anonDentry) Watches() *Watches {
+	return nil
+}
+
+// OnZeroWatches implements Dentry.OnZeroWatches.
+func (d *anonDentry) OnZeroWatches(context.Context) {}

@@ -57,14 +57,23 @@ func getTaskMM(t *kernel.Task) (*mm.MemoryManager, error) {
 	return m, nil
 }
 
+func checkTaskState(t *kernel.Task) error {
+	switch t.ExitState() {
+	case kernel.TaskExitZombie:
+		return syserror.EACCES
+	case kernel.TaskExitDead:
+		return syserror.ESRCH
+	}
+	return nil
+}
+
 // taskDir represents a task-level directory.
 //
 // +stateify savable
 type taskDir struct {
 	ramfs.Dir
 
-	t     *kernel.Task
-	pidns *kernel.PIDNamespace
+	t *kernel.Task
 }
 
 var _ fs.InodeOperations = (*taskDir)(nil)
@@ -84,6 +93,7 @@ func (p *proc) newTaskDir(t *kernel.Task, msrc *fs.MountSource, isThreadGroup bo
 		"maps":          newMaps(t, msrc),
 		"mountinfo":     seqfile.NewSeqFileInode(t, &mountInfoFile{t: t}, msrc),
 		"mounts":        seqfile.NewSeqFileInode(t, &mountsFile{t: t}, msrc),
+		"net":           newNetDir(t, msrc),
 		"ns":            newNamespaceDir(t, msrc),
 		"oom_score":     newOOMScore(t, msrc),
 		"oom_score_adj": newOOMScoreAdj(t, msrc),
@@ -175,7 +185,7 @@ func (f *subtasksFile) Readdir(ctx context.Context, file *fs.File, ser fs.Dentry
 		// Serialize "." and "..".
 		root := fs.RootFromContext(ctx)
 		if root != nil {
-			defer root.DecRef()
+			defer root.DecRef(ctx)
 		}
 		dot, dotdot := file.Dirent.GetDotAttrs(root)
 		if err := dirCtx.DirEmit(".", dot); err != nil {
@@ -253,11 +263,12 @@ func newExe(t *kernel.Task, msrc *fs.MountSource) *fs.Inode {
 }
 
 func (e *exe) executable() (file fsbridge.File, err error) {
+	if err := checkTaskState(e.t); err != nil {
+		return nil, err
+	}
 	e.t.WithMuLocked(func(t *kernel.Task) {
 		mm := t.MemoryManager()
 		if mm == nil {
-			// TODO(b/34851096): Check shouldn't allow Readlink once the
-			// Task is zombied.
 			err = syserror.EACCES
 			return
 		}
@@ -267,7 +278,7 @@ func (e *exe) executable() (file fsbridge.File, err error) {
 		// (with locks held).
 		file = mm.Executable()
 		if file == nil {
-			err = syserror.ENOENT
+			err = syserror.ESRCH
 		}
 	})
 	return
@@ -284,7 +295,7 @@ func (e *exe) Readlink(ctx context.Context, inode *fs.Inode) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer exec.DecRef()
+	defer exec.DecRef(ctx)
 
 	return exec.PathnameWithDeleted(ctx), nil
 }
@@ -312,10 +323,21 @@ func newNamespaceSymlink(t *kernel.Task, msrc *fs.MountSource, name string) *fs.
 	return newProcInode(t, n, msrc, fs.Symlink, t)
 }
 
+// Readlink reads the symlink value.
+func (n *namespaceSymlink) Readlink(ctx context.Context, inode *fs.Inode) (string, error) {
+	if err := checkTaskState(n.t); err != nil {
+		return "", err
+	}
+	return n.Symlink.Readlink(ctx, inode)
+}
+
 // Getlink implements fs.InodeOperations.Getlink.
 func (n *namespaceSymlink) Getlink(ctx context.Context, inode *fs.Inode) (*fs.Dirent, error) {
 	if !kernel.ContextCanTrace(ctx, n.t, false) {
 		return nil, syserror.EACCES
+	}
+	if err := checkTaskState(n.t); err != nil {
+		return nil, err
 	}
 
 	// Create a new regular file to fake the namespace file.
@@ -582,7 +604,7 @@ func (s *statusData) ReadSeqFileData(ctx context.Context, h seqfile.SeqHandle) (
 	var vss, rss, data uint64
 	s.t.WithMuLocked(func(t *kernel.Task) {
 		if fdTable := t.FDTable(); fdTable != nil {
-			fds = fdTable.Size()
+			fds = fdTable.CurrentMaxFDs()
 		}
 		if mm := t.MemoryManager(); mm != nil {
 			vss = mm.VirtualMemorySize()
@@ -852,15 +874,15 @@ func (o *oomScoreAdj) GetFile(ctx context.Context, dirent *fs.Dirent, flags fs.F
 
 // Read implements fs.FileOperations.Read.
 func (f *oomScoreAdjFile) Read(ctx context.Context, _ *fs.File, dst usermem.IOSequence, offset int64) (int64, error) {
-	if offset != 0 {
+	if f.t.ExitState() == kernel.TaskExitDead {
+		return 0, syserror.ESRCH
+	}
+	var buf bytes.Buffer
+	fmt.Fprintf(&buf, "%d\n", f.t.OOMScoreAdj())
+	if offset >= int64(buf.Len()) {
 		return 0, io.EOF
 	}
-	adj, err := f.t.OOMScoreAdj()
-	if err != nil {
-		return 0, err
-	}
-	adjBytes := []byte(strconv.FormatInt(int64(adj), 10) + "\n")
-	n, err := dst.CopyOut(ctx, adjBytes)
+	n, err := dst.CopyOut(ctx, buf.Bytes()[offset:])
 	return int64(n), err
 }
 
@@ -879,6 +901,9 @@ func (f *oomScoreAdjFile) Write(ctx context.Context, _ *fs.File, src usermem.IOS
 		return 0, err
 	}
 
+	if f.t.ExitState() == kernel.TaskExitDead {
+		return 0, syserror.ESRCH
+	}
 	if err := f.t.SetOOMScoreAdj(v); err != nil {
 		return 0, err
 	}

@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// +build arm64
+
 package arch
 
 import (
@@ -20,6 +22,8 @@ import (
 	"syscall"
 
 	"gvisor.dev/gvisor/pkg/cpuid"
+	"gvisor.dev/gvisor/pkg/marshal"
+	"gvisor.dev/gvisor/pkg/marshal/primitive"
 	"gvisor.dev/gvisor/pkg/sentry/limits"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
@@ -71,6 +75,8 @@ const (
 )
 
 // context64 represents an ARM64 context.
+//
+// +stateify savable
 type context64 struct {
 	State
 	sigFPState []aarch64FPState // fpstate to be restored on sigreturn.
@@ -140,16 +146,17 @@ func (c *context64) SetStack(value uintptr) {
 
 // TLS returns the current TLS pointer.
 func (c *context64) TLS() uintptr {
-	// TODO(gvisor.dev/issue/1238): TLS is not supported.
-	// MRS_TPIDR_EL0
-	return 0
+	return uintptr(c.Regs.TPIDR_EL0)
 }
 
 // SetTLS sets the current TLS pointer. Returns false if value is invalid.
 func (c *context64) SetTLS(value uintptr) bool {
-	// TODO(gvisor.dev/issue/1238): TLS is not supported.
-	// MSR_TPIDR_EL0
-	return false
+	if value >= uintptr(maxAddr64) {
+		return false
+	}
+
+	c.Regs.TPIDR_EL0 = uint64(value)
+	return true
 }
 
 // SetOldRSeqInterruptedIP implements Context.SetOldRSeqInterruptedIP.
@@ -158,14 +165,14 @@ func (c *context64) SetOldRSeqInterruptedIP(value uintptr) {
 }
 
 // Native returns the native type for the given val.
-func (c *context64) Native(val uintptr) interface{} {
-	v := uint64(val)
+func (c *context64) Native(val uintptr) marshal.Marshallable {
+	v := primitive.Uint64(val)
 	return &v
 }
 
 // Value returns the generic val for the given native type.
-func (c *context64) Value(val interface{}) uintptr {
-	return uintptr(*val.(*uint64))
+func (c *context64) Value(val marshal.Marshallable) uintptr {
+	return uintptr(*val.(*primitive.Uint64))
 }
 
 // Width returns the byte width of this architecture.
@@ -269,7 +276,7 @@ func (c *context64) PIELoadAddress(l MmapLayout) usermem.Addr {
 }
 
 // PtracePeekUser implements Context.PtracePeekUser.
-func (c *context64) PtracePeekUser(addr uintptr) (interface{}, error) {
+func (c *context64) PtracePeekUser(addr uintptr) (marshal.Marshallable, error) {
 	// TODO(gvisor.dev/issue/1239): Full ptrace supporting for Arm64.
 	return c.Native(0), nil
 }

@@ -30,6 +30,9 @@ type FilesystemType interface {
 	// along with its mount root. A reference is taken on the returned
 	// Filesystem and Dentry.
 	GetFilesystem(ctx context.Context, vfsObj *VirtualFilesystem, creds *auth.Credentials, source string, opts GetFilesystemOptions) (*Filesystem, *Dentry, error)
+
+	// Name returns the name of this FilesystemType.
+	Name() string
 }
 
 // GetFilesystemOptions contains options to FilesystemType.GetFilesystem.
@@ -52,10 +55,13 @@ type registeredFilesystemType struct {
 
 // RegisterFilesystemTypeOptions contains options to
 // VirtualFilesystem.RegisterFilesystem().
+//
+// +stateify savable
 type RegisterFilesystemTypeOptions struct {
-	// If AllowUserMount is true, allow calls to VirtualFilesystem.MountAt()
-	// for which MountOptions.InternalMount == false to use this filesystem
-	// type.
+	// AllowUserMount determines whether users are allowed to mount a file system
+	// of this type, i.e. through mount(2). If AllowUserMount is true, allow calls
+	// to VirtualFilesystem.MountAt() for which MountOptions.InternalMount == false
+	// to use this filesystem type.
 	AllowUserMount bool
 
 	// If AllowUserList is true, make this filesystem type visible in

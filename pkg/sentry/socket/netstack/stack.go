@@ -15,15 +15,15 @@
 package netstack
 
 import (
+	"fmt"
+
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/inet"
-	"gvisor.dev/gvisor/pkg/sentry/socket/netfilter"
 	"gvisor.dev/gvisor/pkg/syserr"
 	"gvisor.dev/gvisor/pkg/syserror"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
-	"gvisor.dev/gvisor/pkg/tcpip/iptables"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
@@ -42,19 +42,29 @@ func (s *Stack) SupportsIPv6() bool {
 	return s.Stack.CheckNetworkProtocol(ipv6.ProtocolNumber)
 }
 
+// Converts Netstack's ARPHardwareType to equivalent linux constants.
+func toLinuxARPHardwareType(t header.ARPHardwareType) uint16 {
+	switch t {
+	case header.ARPHardwareNone:
+		return linux.ARPHRD_NONE
+	case header.ARPHardwareLoopback:
+		return linux.ARPHRD_LOOPBACK
+	case header.ARPHardwareEther:
+		return linux.ARPHRD_ETHER
+	default:
+		panic(fmt.Sprintf("unknown ARPHRD type: %d", t))
+	}
+}
+
 // Interfaces implements inet.Stack.Interfaces.
 func (s *Stack) Interfaces() map[int32]inet.Interface {
 	is := make(map[int32]inet.Interface)
 	for id, ni := range s.Stack.NICInfo() {
-		var devType uint16
-		if ni.Flags.Loopback {
-			devType = linux.ARPHRD_LOOPBACK
-		}
 		is[int32(id)] = inet.Interface{
 			Name:       ni.Name,
 			Addr:       []byte(ni.LinkAddress),
 			Flags:      uint32(nicStateFlagsToLinux(ni.Flags)),
-			DeviceType: devType,
+			DeviceType: toLinuxARPHardwareType(ni.ARPHardwareType),
 			MTU:        ni.MTU,
 		}
 	}
@@ -145,7 +155,7 @@ func (s *Stack) AddInterfaceAddr(idx int32, addr inet.InterfaceAddr) error {
 
 // TCPReceiveBufferSize implements inet.Stack.TCPReceiveBufferSize.
 func (s *Stack) TCPReceiveBufferSize() (inet.TCPBufferSize, error) {
-	var rs tcp.ReceiveBufferSizeOption
+	var rs tcpip.TCPReceiveBufferSizeRangeOption
 	err := s.Stack.TransportProtocolOption(tcp.ProtocolNumber, &rs)
 	return inet.TCPBufferSize{
 		Min:     rs.Min,
@@ -156,17 +166,17 @@ func (s *Stack) TCPReceiveBufferSize() (inet.TCPBufferSize, error) {
 
 // SetTCPReceiveBufferSize implements inet.Stack.SetTCPReceiveBufferSize.
 func (s *Stack) SetTCPReceiveBufferSize(size inet.TCPBufferSize) error {
-	rs := tcp.ReceiveBufferSizeOption{
+	rs := tcpip.TCPReceiveBufferSizeRangeOption{
 		Min:     size.Min,
 		Default: size.Default,
 		Max:     size.Max,
 	}
-	return syserr.TranslateNetstackError(s.Stack.SetTransportProtocolOption(tcp.ProtocolNumber, rs)).ToError()
+	return syserr.TranslateNetstackError(s.Stack.SetTransportProtocolOption(tcp.ProtocolNumber, &rs)).ToError()
 }
 
 // TCPSendBufferSize implements inet.Stack.TCPSendBufferSize.
 func (s *Stack) TCPSendBufferSize() (inet.TCPBufferSize, error) {
-	var ss tcp.SendBufferSizeOption
+	var ss tcpip.TCPSendBufferSizeRangeOption
 	err := s.Stack.TransportProtocolOption(tcp.ProtocolNumber, &ss)
 	return inet.TCPBufferSize{
 		Min:     ss.Min,
@@ -177,59 +187,105 @@ func (s *Stack) TCPSendBufferSize() (inet.TCPBufferSize, error) {
 
 // SetTCPSendBufferSize implements inet.Stack.SetTCPSendBufferSize.
 func (s *Stack) SetTCPSendBufferSize(size inet.TCPBufferSize) error {
-	ss := tcp.SendBufferSizeOption{
+	ss := tcpip.TCPSendBufferSizeRangeOption{
 		Min:     size.Min,
 		Default: size.Default,
 		Max:     size.Max,
 	}
-	return syserr.TranslateNetstackError(s.Stack.SetTransportProtocolOption(tcp.ProtocolNumber, ss)).ToError()
+	return syserr.TranslateNetstackError(s.Stack.SetTransportProtocolOption(tcp.ProtocolNumber, &ss)).ToError()
 }
 
 // TCPSACKEnabled implements inet.Stack.TCPSACKEnabled.
 func (s *Stack) TCPSACKEnabled() (bool, error) {
-	var sack tcp.SACKEnabled
+	var sack tcpip.TCPSACKEnabled
 	err := s.Stack.TransportProtocolOption(tcp.ProtocolNumber, &sack)
 	return bool(sack), syserr.TranslateNetstackError(err).ToError()
 }
 
 // SetTCPSACKEnabled implements inet.Stack.SetTCPSACKEnabled.
 func (s *Stack) SetTCPSACKEnabled(enabled bool) error {
-	return syserr.TranslateNetstackError(s.Stack.SetTransportProtocolOption(tcp.ProtocolNumber, tcp.SACKEnabled(enabled))).ToError()
+	opt := tcpip.TCPSACKEnabled(enabled)
+	return syserr.TranslateNetstackError(s.Stack.SetTransportProtocolOption(tcp.ProtocolNumber, &opt)).ToError()
+}
+
+// TCPRecovery implements inet.Stack.TCPRecovery.
+func (s *Stack) TCPRecovery() (inet.TCPLossRecovery, error) {
+	var recovery tcpip.TCPRecovery
+	if err := s.Stack.TransportProtocolOption(tcp.ProtocolNumber, &recovery); err != nil {
+		return 0, syserr.TranslateNetstackError(err).ToError()
+	}
+	return inet.TCPLossRecovery(recovery), nil
+}
+
+// SetTCPRecovery implements inet.Stack.SetTCPRecovery.
+func (s *Stack) SetTCPRecovery(recovery inet.TCPLossRecovery) error {
+	opt := tcpip.TCPRecovery(recovery)
+	return syserr.TranslateNetstackError(s.Stack.SetTransportProtocolOption(tcp.ProtocolNumber, &opt)).ToError()
 }
 
 // Statistics implements inet.Stack.Statistics.
 func (s *Stack) Statistics(stat interface{}, arg string) error {
 	switch stats := stat.(type) {
+	case *inet.StatDev:
+		for _, ni := range s.Stack.NICInfo() {
+			if ni.Name != arg {
+				continue
+			}
+			// TODO(gvisor.dev/issue/2103) Support stubbed stats.
+			*stats = inet.StatDev{
+				// Receive section.
+				ni.Stats.Rx.Bytes.Value(),   // bytes.
+				ni.Stats.Rx.Packets.Value(), // packets.
+				0,                           // errs.
+				0,                           // drop.
+				0,                           // fifo.
+				0,                           // frame.
+				0,                           // compressed.
+				0,                           // multicast.
+				// Transmit section.
+				ni.Stats.Tx.Bytes.Value(),   // bytes.
+				ni.Stats.Tx.Packets.Value(), // packets.
+				0,                           // errs.
+				0,                           // drop.
+				0,                           // fifo.
+				0,                           // colls.
+				0,                           // carrier.
+				0,                           // compressed.
+			}
+			break
+		}
 	case *inet.StatSNMPIP:
 		ip := Metrics.IP
+		// TODO(gvisor.dev/issue/969) Support stubbed stats.
 		*stats = inet.StatSNMPIP{
-			0,                          // TODO(gvisor.dev/issue/969): Support Ip/Forwarding.
-			0,                          // TODO(gvisor.dev/issue/969): Support Ip/DefaultTTL.
+			0,                          // Ip/Forwarding.
+			0,                          // Ip/DefaultTTL.
 			ip.PacketsReceived.Value(), // InReceives.
-			0,                          // TODO(gvisor.dev/issue/969): Support Ip/InHdrErrors.
+			0,                          // Ip/InHdrErrors.
 			ip.InvalidDestinationAddressesReceived.Value(), // InAddrErrors.
-			0,                               // TODO(gvisor.dev/issue/969): Support Ip/ForwDatagrams.
-			0,                               // TODO(gvisor.dev/issue/969): Support Ip/InUnknownProtos.
-			0,                               // TODO(gvisor.dev/issue/969): Support Ip/InDiscards.
+			0,                               // Ip/ForwDatagrams.
+			0,                               // Ip/InUnknownProtos.
+			0,                               // Ip/InDiscards.
 			ip.PacketsDelivered.Value(),     // InDelivers.
 			ip.PacketsSent.Value(),          // OutRequests.
 			ip.OutgoingPacketErrors.Value(), // OutDiscards.
-			0,                               // TODO(gvisor.dev/issue/969): Support Ip/OutNoRoutes.
-			0,                               // TODO(gvisor.dev/issue/969): Support Ip/ReasmTimeout.
-			0,                               // TODO(gvisor.dev/issue/969): Support Ip/ReasmReqds.
-			0,                               // TODO(gvisor.dev/issue/969): Support Ip/ReasmOKs.
-			0,                               // TODO(gvisor.dev/issue/969): Support Ip/ReasmFails.
-			0,                               // TODO(gvisor.dev/issue/969): Support Ip/FragOKs.
-			0,                               // TODO(gvisor.dev/issue/969): Support Ip/FragFails.
-			0,                               // TODO(gvisor.dev/issue/969): Support Ip/FragCreates.
+			0,                               // Ip/OutNoRoutes.
+			0,                               // Support Ip/ReasmTimeout.
+			0,                               // Support Ip/ReasmReqds.
+			0,                               // Support Ip/ReasmOKs.
+			0,                               // Support Ip/ReasmFails.
+			0,                               // Support Ip/FragOKs.
+			0,                               // Support Ip/FragFails.
+			0,                               // Support Ip/FragCreates.
 		}
 	case *inet.StatSNMPICMP:
 		in := Metrics.ICMP.V4PacketsReceived.ICMPv4PacketStats
 		out := Metrics.ICMP.V4PacketsSent.ICMPv4PacketStats
+		// TODO(gvisor.dev/issue/969) Support stubbed stats.
 		*stats = inet.StatSNMPICMP{
-			0, // TODO(gvisor.dev/issue/969): Support Icmp/InMsgs.
+			0, // Icmp/InMsgs.
 			Metrics.ICMP.V4PacketsSent.Dropped.Value(), // InErrors.
-			0,                         // TODO(gvisor.dev/issue/969): Support Icmp/InCsumErrors.
+			0,                         // Icmp/InCsumErrors.
 			in.DstUnreachable.Value(), // InDestUnreachs.
 			in.TimeExceeded.Value(),   // InTimeExcds.
 			in.ParamProblem.Value(),   // InParmProbs.
@@ -241,7 +297,7 @@ func (s *Stack) Statistics(stat interface{}, arg string) error {
 			in.TimestampReply.Value(), // InTimestampReps.
 			in.InfoRequest.Value(),    // InAddrMasks.
 			in.InfoReply.Value(),      // InAddrMaskReps.
-			0,                         // TODO(gvisor.dev/issue/969): Support Icmp/OutMsgs.
+			0,                         // Icmp/OutMsgs.
 			Metrics.ICMP.V4PacketsReceived.Invalid.Value(), // OutErrors.
 			out.DstUnreachable.Value(),                     // OutDestUnreachs.
 			out.TimeExceeded.Value(),                       // OutTimeExcds.
@@ -277,15 +333,16 @@ func (s *Stack) Statistics(stat interface{}, arg string) error {
 		}
 	case *inet.StatSNMPUDP:
 		udp := Metrics.UDP
+		// TODO(gvisor.dev/issue/969) Support stubbed stats.
 		*stats = inet.StatSNMPUDP{
 			udp.PacketsReceived.Value(),     // InDatagrams.
 			udp.UnknownPortErrors.Value(),   // NoPorts.
-			0,                               // TODO(gvisor.dev/issue/969): Support Udp/InErrors.
+			0,                               // Udp/InErrors.
 			udp.PacketsSent.Value(),         // OutDatagrams.
 			udp.ReceiveBufferErrors.Value(), // RcvbufErrors.
-			0,                               // TODO(gvisor.dev/issue/969): Support Udp/SndbufErrors.
-			0,                               // TODO(gvisor.dev/issue/969): Support Udp/InCsumErrors.
-			0,                               // TODO(gvisor.dev/issue/969): Support Udp/IgnoredMulti.
+			0,                               // Udp/SndbufErrors.
+			udp.ChecksumErrors.Value(),      // Udp/InCsumErrors.
+			0,                               // Udp/IgnoredMulti.
 		}
 	default:
 		return syserr.ErrEndpointOperation.ToError()
@@ -332,14 +389,8 @@ func (s *Stack) RouteTable() []inet.Route {
 }
 
 // IPTables returns the stack's iptables.
-func (s *Stack) IPTables() (iptables.IPTables, error) {
+func (s *Stack) IPTables() (*stack.IPTables, error) {
 	return s.Stack.IPTables(), nil
-}
-
-// FillDefaultIPTables sets the stack's iptables to the default tables, which
-// allow and do not modify all traffic.
-func (s *Stack) FillDefaultIPTables() {
-	netfilter.FillDefaultIPTables(s.Stack)
 }
 
 // Resume implements inet.Stack.Resume.
@@ -360,4 +411,25 @@ func (s *Stack) CleanupEndpoints() []stack.TransportEndpoint {
 // RestoreCleanupEndpoints implements inet.Stack.RestoreCleanupEndpoints.
 func (s *Stack) RestoreCleanupEndpoints(es []stack.TransportEndpoint) {
 	s.Stack.RestoreCleanupEndpoints(es)
+}
+
+// Forwarding implements inet.Stack.Forwarding.
+func (s *Stack) Forwarding(protocol tcpip.NetworkProtocolNumber) bool {
+	switch protocol {
+	case ipv4.ProtocolNumber, ipv6.ProtocolNumber:
+		return s.Stack.Forwarding(protocol)
+	default:
+		panic(fmt.Sprintf("Forwarding(%v) failed: unsupported protocol", protocol))
+	}
+}
+
+// SetForwarding implements inet.Stack.SetForwarding.
+func (s *Stack) SetForwarding(protocol tcpip.NetworkProtocolNumber, enable bool) error {
+	switch protocol {
+	case ipv4.ProtocolNumber, ipv6.ProtocolNumber:
+		s.Stack.SetForwarding(protocol, enable)
+	default:
+		panic(fmt.Sprintf("SetForwarding(%v) failed: unsupported protocol", protocol))
+	}
+	return nil
 }

@@ -13,7 +13,7 @@ type bufferElementMapper struct{}
 // This default implementation should be inlined.
 //
 //go:nosplit
-func (bufferElementMapper) linkerFor(elem *Buffer) *Buffer { return elem }
+func (bufferElementMapper) linkerFor(elem *buffer) *buffer { return elem }
 
 // List is an intrusive list. Entries can be added to or removed from the list
 // in O(1) time and with no additional memory allocations.
@@ -27,8 +27,8 @@ func (bufferElementMapper) linkerFor(elem *Buffer) *Buffer { return elem }
 //
 // +stateify savable
 type bufferList struct {
-	head *Buffer
-	tail *Buffer
+	head *buffer
+	tail *buffer
 }
 
 // Reset resets list l to the empty state.
@@ -43,21 +43,30 @@ func (l *bufferList) Empty() bool {
 }
 
 // Front returns the first element of list l or nil.
-func (l *bufferList) Front() *Buffer {
+func (l *bufferList) Front() *buffer {
 	return l.head
 }
 
 // Back returns the last element of list l or nil.
-func (l *bufferList) Back() *Buffer {
+func (l *bufferList) Back() *buffer {
 	return l.tail
 }
 
+// Len returns the number of elements in the list.
+//
+// NOTE: This is an O(n) operation.
+func (l *bufferList) Len() (count int) {
+	for e := l.Front(); e != nil; e = (bufferElementMapper{}.linkerFor(e)).Next() {
+		count++
+	}
+	return count
+}
+
 // PushFront inserts the element e at the front of list l.
-func (l *bufferList) PushFront(e *Buffer) {
+func (l *bufferList) PushFront(e *buffer) {
 	linker := bufferElementMapper{}.linkerFor(e)
 	linker.SetNext(l.head)
 	linker.SetPrev(nil)
-
 	if l.head != nil {
 		bufferElementMapper{}.linkerFor(l.head).SetPrev(e)
 	} else {
@@ -68,11 +77,10 @@ func (l *bufferList) PushFront(e *Buffer) {
 }
 
 // PushBack inserts the element e at the back of list l.
-func (l *bufferList) PushBack(e *Buffer) {
+func (l *bufferList) PushBack(e *buffer) {
 	linker := bufferElementMapper{}.linkerFor(e)
 	linker.SetNext(nil)
 	linker.SetPrev(l.tail)
-
 	if l.tail != nil {
 		bufferElementMapper{}.linkerFor(l.tail).SetNext(e)
 	} else {
@@ -93,13 +101,12 @@ func (l *bufferList) PushBackList(m *bufferList) {
 
 		l.tail = m.tail
 	}
-
 	m.head = nil
 	m.tail = nil
 }
 
 // InsertAfter inserts e after b.
-func (l *bufferList) InsertAfter(b, e *Buffer) {
+func (l *bufferList) InsertAfter(b, e *buffer) {
 	bLinker := bufferElementMapper{}.linkerFor(b)
 	eLinker := bufferElementMapper{}.linkerFor(e)
 
@@ -117,7 +124,7 @@ func (l *bufferList) InsertAfter(b, e *Buffer) {
 }
 
 // InsertBefore inserts e before a.
-func (l *bufferList) InsertBefore(a, e *Buffer) {
+func (l *bufferList) InsertBefore(a, e *buffer) {
 	aLinker := bufferElementMapper{}.linkerFor(a)
 	eLinker := bufferElementMapper{}.linkerFor(e)
 
@@ -134,20 +141,20 @@ func (l *bufferList) InsertBefore(a, e *Buffer) {
 }
 
 // Remove removes e from l.
-func (l *bufferList) Remove(e *Buffer) {
+func (l *bufferList) Remove(e *buffer) {
 	linker := bufferElementMapper{}.linkerFor(e)
 	prev := linker.Prev()
 	next := linker.Next()
 
 	if prev != nil {
 		bufferElementMapper{}.linkerFor(prev).SetNext(next)
-	} else {
+	} else if l.head == e {
 		l.head = next
 	}
 
 	if next != nil {
 		bufferElementMapper{}.linkerFor(next).SetPrev(prev)
-	} else {
+	} else if l.tail == e {
 		l.tail = prev
 	}
 
@@ -161,26 +168,26 @@ func (l *bufferList) Remove(e *Buffer) {
 //
 // +stateify savable
 type bufferEntry struct {
-	next *Buffer
-	prev *Buffer
+	next *buffer
+	prev *buffer
 }
 
 // Next returns the entry that follows e in the list.
-func (e *bufferEntry) Next() *Buffer {
+func (e *bufferEntry) Next() *buffer {
 	return e.next
 }
 
 // Prev returns the entry that precedes e in the list.
-func (e *bufferEntry) Prev() *Buffer {
+func (e *bufferEntry) Prev() *buffer {
 	return e.prev
 }
 
 // SetNext assigns 'entry' as the entry that follows e in the list.
-func (e *bufferEntry) SetNext(elem *Buffer) {
+func (e *bufferEntry) SetNext(elem *buffer) {
 	e.next = elem
 }
 
 // SetPrev assigns 'entry' as the entry that precedes e in the list.
-func (e *bufferEntry) SetPrev(elem *Buffer) {
+func (e *bufferEntry) SetPrev(elem *buffer) {
 	e.prev = elem
 }

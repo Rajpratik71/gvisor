@@ -44,7 +44,7 @@ func getdents(t *kernel.Task, args arch.SyscallArguments, isGetdents64 bool) (ui
 	if file == nil {
 		return 0, nil, syserror.EBADF
 	}
-	defer file.DecRef()
+	defer file.DecRef(t)
 
 	cb := getGetdentsCallback(t, addr, size, isGetdents64)
 	err := file.IterDirents(t, cb)
@@ -97,7 +97,8 @@ func (cb *getdentsCallback) Handle(dirent vfs.Dirent) error {
 		//     char           d_name[]; /* Filename (null-terminated) */
 		// };
 		size := 8 + 8 + 2 + 1 + 1 + len(dirent.Name)
-		if size < cb.remaining {
+		size = (size + 7) &^ 7 // round up to multiple of 8
+		if size > cb.remaining {
 			return syserror.EINVAL
 		}
 		buf = cb.t.CopyScratchBuffer(size)
@@ -106,7 +107,12 @@ func (cb *getdentsCallback) Handle(dirent vfs.Dirent) error {
 		usermem.ByteOrder.PutUint16(buf[16:18], uint16(size))
 		buf[18] = dirent.Type
 		copy(buf[19:], dirent.Name)
-		buf[size-1] = 0 // NUL terminator
+		// Zero out all remaining bytes in buf, including the NUL terminator
+		// after dirent.Name.
+		bufTail := buf[19+len(dirent.Name):]
+		for i := range bufTail {
+			bufTail[i] = 0
+		}
 	} else {
 		// struct linux_dirent {
 		//     unsigned long  d_ino;     /* Inode number */
@@ -124,8 +130,9 @@ func (cb *getdentsCallback) Handle(dirent vfs.Dirent) error {
 		if cb.t.Arch().Width() != 8 {
 			panic(fmt.Sprintf("unsupported sizeof(unsigned long): %d", cb.t.Arch().Width()))
 		}
-		size := 8 + 8 + 2 + 1 + 1 + 1 + len(dirent.Name)
-		if size < cb.remaining {
+		size := 8 + 8 + 2 + 1 + 1 + len(dirent.Name)
+		size = (size + 7) &^ 7 // round up to multiple of sizeof(long)
+		if size > cb.remaining {
 			return syserror.EINVAL
 		}
 		buf = cb.t.CopyScratchBuffer(size)
@@ -133,8 +140,13 @@ func (cb *getdentsCallback) Handle(dirent vfs.Dirent) error {
 		usermem.ByteOrder.PutUint64(buf[8:16], uint64(dirent.NextOff))
 		usermem.ByteOrder.PutUint16(buf[16:18], uint16(size))
 		copy(buf[18:], dirent.Name)
-		buf[size-3] = 0 // NUL terminator
-		buf[size-2] = 0 // zero padding byte
+		// Zero out all remaining bytes in buf, including the NUL terminator
+		// after dirent.Name and the zero padding byte between the name and
+		// dirent type.
+		bufTail := buf[18+len(dirent.Name) : size-1]
+		for i := range bufTail {
+			bufTail[i] = 0
+		}
 		buf[size-1] = dirent.Type
 	}
 	n, err := cb.t.CopyOutBytes(cb.addr, buf)

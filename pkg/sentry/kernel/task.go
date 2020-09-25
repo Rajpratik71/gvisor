@@ -68,6 +68,21 @@ type Task struct {
 	// runState is exclusive to the task goroutine.
 	runState taskRunState
 
+	// taskWorkCount represents the current size of the task work queue. It is
+	// used to avoid acquiring taskWorkMu when the queue is empty.
+	//
+	// Must accessed with atomic memory operations.
+	taskWorkCount int32
+
+	// taskWorkMu protects taskWork.
+	taskWorkMu sync.Mutex `state:"nosave"`
+
+	// taskWork is a queue of work to be executed before resuming user execution.
+	// It is similar to the task_work mechanism in Linux.
+	//
+	// taskWork is exclusive to the task goroutine.
+	taskWork []TaskWorker
+
 	// haveSyscallReturn is true if tc.Arch().Return() represents a value
 	// returned by a syscall (or set by ptrace after a syscall).
 	//
@@ -484,7 +499,7 @@ type Task struct {
 	// bit.
 	//
 	// numaPolicy and numaNodeMask are protected by mu.
-	numaPolicy   int32
+	numaPolicy   linux.NumaPolicy
 	numaNodeMask uint64
 
 	// netns is the task's network namespace. netns is never nil.
@@ -550,18 +565,20 @@ type Task struct {
 	// futexWaiter is exclusive to the task goroutine.
 	futexWaiter *futex.Waiter `state:"nosave"`
 
+	// robustList is a pointer to the head of the tasks's robust futex
+	// list.
+	robustList usermem.Addr
+
 	// startTime is the real time at which the task started. It is set when
 	// a Task is created or invokes execve(2).
 	//
 	// startTime is protected by mu.
 	startTime ktime.Time
 
-	// oomScoreAdj is the task's OOM score adjustment. This is currently not
-	// used but is maintained for consistency.
-	// TODO(gvisor.dev/issue/1967)
+	// kcov is the kcov instance providing code coverage owned by this task.
 	//
-	// oomScoreAdj is protected by mu, and is owned by the task goroutine.
-	oomScoreAdj int32
+	// kcov is exclusive to the task goroutine.
+	kcov *Kcov
 }
 
 func (t *Task) savePtraceTracer() *Task {
@@ -718,17 +735,17 @@ func (t *Task) SyscallRestartBlock() SyscallRestartBlock {
 func (t *Task) IsChrooted() bool {
 	if VFS2Enabled {
 		realRoot := t.mountNamespaceVFS2.Root()
-		defer realRoot.DecRef()
+		defer realRoot.DecRef(t)
 		root := t.fsContext.RootDirectoryVFS2()
-		defer root.DecRef()
+		defer root.DecRef(t)
 		return root != realRoot
 	}
 
 	realRoot := t.tg.mounts.Root()
-	defer realRoot.DecRef()
+	defer realRoot.DecRef(t)
 	root := t.fsContext.RootDirectory()
 	if root != nil {
-		defer root.DecRef()
+		defer root.DecRef(t)
 	}
 	return root != realRoot
 }
@@ -782,6 +799,15 @@ func (t *Task) GetFileVFS2(fd int32) *vfs.FileDescription {
 // Precondition: same as FDTable.
 func (t *Task) NewFDs(fd int32, files []*fs.File, flags FDFlags) ([]int32, error) {
 	return t.fdTable.NewFDs(t, fd, files, flags)
+}
+
+// NewFDsVFS2 is a convenience wrapper for t.FDTable().NewFDsVFS2.
+//
+// This automatically passes the task as the context.
+//
+// Precondition: same as FDTable.
+func (t *Task) NewFDsVFS2(fd int32, files []*vfs.FileDescription, flags FDFlags) ([]int32, error) {
+	return t.fdTable.NewFDsVFS2(t, fd, files, flags)
 }
 
 // NewFDFrom is a convenience wrapper for t.FDTable().NewFDs with a single file.
@@ -856,27 +882,42 @@ func (t *Task) ContainerID() string {
 	return t.containerID
 }
 
-// OOMScoreAdj gets the task's OOM score adjustment.
-func (t *Task) OOMScoreAdj() (int32, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.ExitState() == TaskExitDead {
-		return 0, syserror.ESRCH
-	}
-	return t.oomScoreAdj, nil
+// OOMScoreAdj gets the task's thread group's OOM score adjustment.
+func (t *Task) OOMScoreAdj() int32 {
+	return atomic.LoadInt32(&t.tg.oomScoreAdj)
 }
 
-// SetOOMScoreAdj sets the task's OOM score adjustment. The value should be
-// between -1000 and 1000 inclusive.
+// SetOOMScoreAdj sets the task's thread group's OOM score adjustment. The
+// value should be between -1000 and 1000 inclusive.
 func (t *Task) SetOOMScoreAdj(adj int32) error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.ExitState() == TaskExitDead {
-		return syserror.ESRCH
-	}
 	if adj > 1000 || adj < -1000 {
 		return syserror.EINVAL
 	}
-	t.oomScoreAdj = adj
+	atomic.StoreInt32(&t.tg.oomScoreAdj, adj)
 	return nil
+}
+
+// UID returns t's uid.
+// TODO(gvisor.dev/issue/170): This method is not namespaced yet.
+func (t *Task) UID() uint32 {
+	return uint32(t.Credentials().EffectiveKUID)
+}
+
+// GID returns t's gid.
+// TODO(gvisor.dev/issue/170): This method is not namespaced yet.
+func (t *Task) GID() uint32 {
+	return uint32(t.Credentials().EffectiveKGID)
+}
+
+// SetKcov sets the kcov instance associated with t.
+func (t *Task) SetKcov(k *Kcov) {
+	t.kcov = k
+}
+
+// ResetKcov clears the kcov instance associated with t.
+func (t *Task) ResetKcov() {
+	if t.kcov != nil {
+		t.kcov.Reset()
+		t.kcov = nil
+	}
 }

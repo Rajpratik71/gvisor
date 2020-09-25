@@ -19,15 +19,23 @@ package arch
 import (
 	"fmt"
 	"io"
-	"syscall"
 
-	"gvisor.dev/gvisor/pkg/binary"
+	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/cpuid"
 	"gvisor.dev/gvisor/pkg/log"
 	rpb "gvisor.dev/gvisor/pkg/sentry/arch/registers_go_proto"
 	"gvisor.dev/gvisor/pkg/syserror"
-	"gvisor.dev/gvisor/pkg/usermem"
 )
+
+// Registers represents the CPU registers for this architecture.
+//
+// +stateify savable
+type Registers struct {
+	linux.PtraceRegs
+
+	// TPIDR_EL0 is the EL0 Read/Write Software Thread ID Register.
+	TPIDR_EL0 uint64
+}
 
 const (
 	// SyscallWidth is the width of insturctions.
@@ -47,9 +55,14 @@ const ARMTrapFlag = uint64(1) << 21
 type aarch64FPState []byte
 
 // initAarch64FPState sets up initial state.
+//
+// Related code in Linux kernel: fpsimd_flush_thread().
+// FPCR = FPCR_RM_RN (0x0 << 22).
+//
+// Currently, aarch64FPState is only a space of 0x210 length for fpstate.
+// The fp head is useless in sentry/ptrace/kvm.
+//
 func initAarch64FPState(data aarch64FPState) {
-	binary.LittleEndian.PutUint32(data, fpsimdMagic)
-	binary.LittleEndian.PutUint32(data[4:], fpsimdContextSize)
 }
 
 func newAarch64FPStateSlice() []byte {
@@ -88,15 +101,20 @@ func NewFloatingPointData() *FloatingPointData {
 
 // State contains the common architecture bits for aarch64 (the build tag of this
 // file ensures it's only built on aarch64).
+//
+// +stateify savable
 type State struct {
 	// The system registers.
-	Regs syscall.PtraceRegs `state:".(syscallPtraceRegs)"`
+	Regs Registers
 
 	// Our floating point state.
 	aarch64FPState `state:"wait"`
 
 	// FeatureSet is a pointer to the currently active feature set.
 	FeatureSet *cpuid.FeatureSet
+
+	// OrigR0 stores the value of register R0.
+	OrigR0 uint64
 }
 
 // Proto returns a protobuf representation of the system registers in State.
@@ -146,6 +164,7 @@ func (s *State) Fork() State {
 		Regs:           s.Regs,
 		aarch64FPState: s.aarch64FPState.fork(),
 		FeatureSet:     s.FeatureSet,
+		OrigR0:         s.OrigR0,
 	}
 }
 
@@ -218,25 +237,27 @@ func (s *State) RegisterMap() (map[string]uintptr, error) {
 
 // PtraceGetRegs implements Context.PtraceGetRegs.
 func (s *State) PtraceGetRegs(dst io.Writer) (int, error) {
-	return dst.Write(binary.Marshal(nil, usermem.ByteOrder, s.ptraceGetRegs()))
+	regs := s.ptraceGetRegs()
+	n, err := regs.WriteTo(dst)
+	return int(n), err
 }
 
-func (s *State) ptraceGetRegs() syscall.PtraceRegs {
+func (s *State) ptraceGetRegs() Registers {
 	return s.Regs
 }
 
-var ptraceRegsSize = int(binary.Size(syscall.PtraceRegs{}))
+var ptraceRegistersSize = (*linux.PtraceRegs)(nil).SizeBytes()
 
 // PtraceSetRegs implements Context.PtraceSetRegs.
 func (s *State) PtraceSetRegs(src io.Reader) (int, error) {
-	var regs syscall.PtraceRegs
-	buf := make([]byte, ptraceRegsSize)
+	var regs Registers
+	buf := make([]byte, ptraceRegistersSize)
 	if _, err := io.ReadFull(src, buf); err != nil {
 		return 0, err
 	}
-	binary.Unmarshal(buf, usermem.ByteOrder, &regs)
+	regs.UnmarshalUnsafe(buf)
 	s.Regs = regs
-	return ptraceRegsSize, nil
+	return ptraceRegistersSize, nil
 }
 
 // PtraceGetFPRegs implements Context.PtraceGetFPRegs.
@@ -255,13 +276,14 @@ func (s *State) PtraceSetFPRegs(src io.Reader) (int, error) {
 const (
 	_NT_PRSTATUS = 1
 	_NT_PRFPREG  = 2
+	_NT_ARM_TLS  = 0x401
 )
 
 // PtraceGetRegSet implements Context.PtraceGetRegSet.
 func (s *State) PtraceGetRegSet(regset uintptr, dst io.Writer, maxlen int) (int, error) {
 	switch regset {
 	case _NT_PRSTATUS:
-		if maxlen < ptraceRegsSize {
+		if maxlen < ptraceRegistersSize {
 			return 0, syserror.EFAULT
 		}
 		return s.PtraceGetRegs(dst)
@@ -274,7 +296,7 @@ func (s *State) PtraceGetRegSet(regset uintptr, dst io.Writer, maxlen int) (int,
 func (s *State) PtraceSetRegSet(regset uintptr, src io.Reader, maxlen int) (int, error) {
 	switch regset {
 	case _NT_PRSTATUS:
-		if maxlen < ptraceRegsSize {
+		if maxlen < ptraceRegistersSize {
 			return 0, syserror.EFAULT
 		}
 		return s.PtraceSetRegs(src)
